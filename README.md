@@ -47,7 +47,8 @@ These checks validate packaging; they do not evaluate extraction quality.
 After the backend publishing API is deployed:
 
 - Create a GitHub environment named `us-staging`, restricted to `main`.
-- In that environment, set `SKILLS_API_URL` to the backend's HTTPS base URL.
+- In that environment, set `SKILLS_API_URL` to the backend's HTTPS base URL,
+  without `/api/v1`. The publisher calls `/api/v1/internal/skills`.
 - Configure the backend's `SKILLS_PUBLISH_AUDIENCE` as `furtherai-skills-us-staging`
   and its FurtherAI ownership and Azure storage settings.
 - Set the **repository variable** `SKILLS_PUBLISH_ENABLED` to `true`.

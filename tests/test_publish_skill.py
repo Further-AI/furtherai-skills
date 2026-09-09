@@ -82,7 +82,7 @@ def test_publish_skill_uploads_exact_artifact_then_promotes_observed_version(
     assert parse_qs(urlsplit(token_request.full_url).query) == {"request": ["1"], "audience": [AUDIENCE]}
     assert token_request.get_header("Authorization") == "Bearer request-token"
     assert upload.method == "POST"
-    assert upload.full_url == f"{API_URL}/internal/skills/document-extraction/versions"
+    assert upload.full_url == f"{API_URL}/api/v1/internal/skills/document-extraction/versions"
     assert upload.get_header("Authorization") == "Bearer identity-token"
     message = BytesParser(policy=policy.default).parsebytes(
         f"Content-Type: {upload.get_header('Content-type')}\r\n\r\n".encode() + upload.data
@@ -97,7 +97,7 @@ def test_publish_skill_uploads_exact_artifact_then_promotes_observed_version(
         "bundle": bundle.read_bytes(),
     }
     assert promote.method == "PUT"
-    assert promote.full_url == f"{API_URL}/internal/skills/document-extraction/channels/stable"
+    assert promote.full_url == f"{API_URL}/api/v1/internal/skills/document-extraction/channels/stable"
     assert promote.get_header("Authorization") == "Bearer identity-token"
     assert json.loads(promote.data) == {"content_digest": DIGEST, "expected_digest": stable_digest}
 

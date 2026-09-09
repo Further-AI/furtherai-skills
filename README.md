@@ -4,8 +4,15 @@ This repository stores, validates, and packages skills for FurtherAI agents. A
 skill is a folder of instructions and optional supporting files that an agent
 uses to perform a task.
 
-The first skill, [document-extraction](skills/document-extraction/SKILL.md),
-provides instructions for extracting structured fields from insurance documents.
+## Available skills
+
+| Skill | Purpose |
+| --- | --- |
+| [Document extraction](skills/document-extraction/SKILL.md) | Extract structured fields from insurance documents. |
+| [Policy comparison](skills/policy-comparison/SKILL.md) | Compare policies, quotes, and renewal changes. |
+| [Loss-run analysis](skills/loss-run-analysis/SKILL.md) | Summarize claims history, losses, and trends. |
+| [Submission intake](skills/submission-intake/SKILL.md) | Summarize submission documents, missing information, and risk flags. |
+| [Coverage advisory](skills/coverage-advisory/SKILL.md) | Explain coverage, policy terms, and insurance requirements. |
 
 ## Getting started
 
@@ -56,7 +63,7 @@ After the backend publishing API is deployed:
 - Set the **repository variable** `SKILLS_PUBLISH_ENABLED` to `true`.
 
 Run **Validate and publish** manually on the current `main` commit to publish the
-pilot. Later merges publish automatically. No Azure credentials or long-lived
+skills. Later merges publish automatically. No Azure credentials or long-lived
 publishing token are needed in this repository. A promotion conflict stops the run;
 check the competing release before rerunning the current `main` commit.
 
@@ -65,7 +72,7 @@ check the competing release before rerunning the current `main` commit.
 Each skill follows the [Agent Skills format](https://agentskills.io/specification):
 create `skills/<name>/SKILL.md` with YAML `name` and `description` between `---`
 delimiters, followed by the instructions. The name must match the folder.
-Use the existing skill as an example.
+Use an existing skill as an example.
 
 Optional `scripts/`, `references/`, `assets/`, and other resource files are included
 recursively. Only the skill's root `tests/` directory is excluded. Run the same

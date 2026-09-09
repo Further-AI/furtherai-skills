@@ -27,9 +27,9 @@ and executable flags. Unchanged inputs produce identical ZIPs.
 ## Where bundles go
 
 On pull requests and pushes to `main`, CI runs tests, checks types, and packages
-`document-extraction`. Open a completed run in
+every directory under `skills/`. Open a completed run in
 [Actions](https://github.com/Further-AI/furtherai-skills/actions/workflows/validate.yml)
-and download `document-extraction` under **Artifacts** to get the ZIP.
+and download `skill-bundles` under **Artifacts** to get one ZIP per skill.
 
 When publishing is enabled, a successful run on the current `main` commit also:
 
@@ -38,8 +38,10 @@ When publishing is enabled, a successful run on the current `main` commit also:
    The backend stores the immutable bundle in Azure's private `skill-bundles` container.
 3. Promotes the returned content digest to `stable`.
 
-Failed checks or uploads block promotion. Releases run one at a time; stale commits
-and conflicting promotions fail. Existing workflow runs keep their pinned versions.
+All skills must pass validation before publishing starts. Bundles publish and promote
+one at a time; a failure stops the remaining bundles. Earlier promotions remain in
+place. Releases run one at a time; stale commits and conflicting promotions fail.
+Existing workflow runs keep their pinned versions.
 These checks validate packaging; they do not evaluate extraction quality.
 
 ## Enable staging publishing
@@ -67,7 +69,7 @@ Use the existing skill as an example.
 
 Optional `scripts/`, `references/`, `assets/`, and other resource files are included
 recursively. Only the skill's root `tests/` directory is excluded. Run the same
-packaging command with your skill's path; CI currently targets the first skill.
+packaging command with your skill's path; CI discovers it automatically.
 
 Packaging rejects symlinks, special files, and unsafe paths. Limits per skill:
 

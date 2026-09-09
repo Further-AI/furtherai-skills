@@ -31,9 +31,31 @@ On pull requests and pushes to `main`, CI runs tests, checks types, and packages
 [Actions](https://github.com/Further-AI/furtherai-skills/actions/workflows/validate.yml)
 and download `document-extraction` under **Artifacts** to get the ZIP.
 
-Bundles currently stay local or in GitHub Actions. Publishing to the backend
-skills catalog and running skills in agents are not connected yet. These checks
-validate packaging; they do not evaluate extraction quality.
+When publishing is enabled, a successful run on the current `main` commit also:
+
+1. Authenticates to the backend with GitHub OIDC.
+2. Publishes the validated ZIP and its repository/commit provenance to US staging.
+   The backend stores the immutable bundle in Azure's private `skill-bundles` container.
+3. Promotes the returned content digest to `stable`.
+
+Failed checks or uploads block promotion. Releases run one at a time; stale commits
+and conflicting promotions fail. Existing workflow runs keep their pinned versions.
+These checks validate packaging; they do not evaluate extraction quality.
+
+## Enable staging publishing
+
+After the backend publishing API is deployed:
+
+- Create a GitHub environment named `us-staging`, restricted to `main`.
+- In that environment, set `SKILLS_API_URL` to the backend's HTTPS base URL.
+- Configure the backend's `SKILLS_PUBLISH_AUDIENCE` as `furtherai-skills-us-staging`
+  and its FurtherAI ownership and Azure storage settings.
+- Set the **repository variable** `SKILLS_PUBLISH_ENABLED` to `true`.
+
+Run **Validate and publish** manually on the current `main` commit to publish the
+pilot. Later merges publish automatically. No Azure credentials or long-lived
+publishing token are needed in this repository. A promotion conflict stops the run;
+check the competing release before rerunning the current `main` commit.
 
 ## Adding a skill
 
@@ -63,8 +85,8 @@ Metadata field lengths follow the [Agent Skills specification](https://agentskil
 
 ## Development
 
-The packaging code lives in [scripts/skill_bundle.py](scripts/skill_bundle.py),
-with tests in [tests/test_skill_bundle.py](tests/test_skill_bundle.py).
+Packaging lives in [scripts/skill_bundle.py](scripts/skill_bundle.py); publishing
+lives in [scripts/publish_skill.py](scripts/publish_skill.py). Tests are in `tests/`.
 
 ```sh
 uv run pytest -x --tb=short

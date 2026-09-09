@@ -141,7 +141,7 @@ def publish_skill(bundle: Path, *, api_url: str, audience: str, context: CIConte
     body, content_type = _multipart(bundle, context)
     token = _identity_token(context, audience)
     headers = {"Authorization": f"Bearer {token}"}
-    skill_url = f"{api_url.rstrip('/')}/internal/skills/{name}"
+    skill_url = f"{api_url.rstrip('/')}/api/v1/internal/skills/{name}"
     response = _request(
         Request(
             f"{skill_url}/versions",

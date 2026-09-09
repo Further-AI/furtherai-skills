@@ -1,11 +1,83 @@
-"""Exercise the workflow's guard against publishing an older main commit."""
+"""Exercise CI packaging, publishing failures, and stale-commit protection."""
 
 import os
 import subprocess
+import sys
 from pathlib import Path
+from textwrap import dedent
 
 import pytest
 import yaml
+
+
+def run_workflow_step(
+    job: str, name: str, cwd: Path, env: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    """Run the workflow's actual step with GitHub Actions' fail-fast shell behavior."""
+    workflow = yaml.safe_load((Path(__file__).parents[1] / ".github/workflows/validate.yml").read_text())
+    command = next(step["run"] for step in workflow["jobs"][job]["steps"] if step.get("name") == name)
+    return subprocess.run(
+        ["bash", "-e", "-c", command],
+        cwd=cwd, env=env, capture_output=True, text=True, check=False,
+    )
+
+
+@pytest.fixture
+def workflow_environment(tmp_path: Path) -> dict[str, str]:
+    """Use the test interpreter while retaining the workflow's real shell loop."""
+    executable = tmp_path / "uv"
+    executable.write_text('#!/bin/sh\nshift\nshift\nexec "$TEST_PYTHON" "$@"\n')
+    executable.chmod(0o755)
+    (tmp_path / "scripts").mkdir()
+    return {**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}", "TEST_PYTHON": sys.executable}
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_workflow_packages_all_skills_and_rejects_invalid_content(
+    tmp_path: Path, workflow_environment: dict[str, str], invalid: bool,
+) -> None:
+    source = Path(__file__).parents[1] / "scripts/skill_bundle.py"
+    (tmp_path / "scripts/skill_bundle.py").write_bytes(source.read_bytes())
+    names = ("first-skill", "second-skill", "third-skill")
+    for name in names:
+        directory = tmp_path / "skills" / name
+        directory.mkdir(parents=True)
+        content = f"---\nname: {name}\ndescription: Test instructions.\n---\nRead the input.\n"
+        if invalid and name == "second-skill":
+            content = "Missing metadata"
+        (directory / "SKILL.md").write_text(content)
+    result = run_workflow_step("validate", "Package skills", tmp_path, workflow_environment)
+    assert result.returncode == (1 if invalid else 0), result.stderr
+    expected = ["first-skill.zip"] if invalid else [f"{name}.zip" for name in names]
+    assert sorted(path.name for path in (tmp_path / "dist").iterdir()) == expected
+
+
+@pytest.mark.parametrize("fail_second", [False, True])
+def test_workflow_publishes_each_bundle_and_stops_on_failure(
+    tmp_path: Path, workflow_environment: dict[str, str], fail_second: bool,
+) -> None:
+    (tmp_path / "dist").mkdir()
+    for name in ("a", "b", "c"):
+        (tmp_path / "dist" / f"{name}.zip").write_bytes(name.encode())
+    (tmp_path / "scripts/publish_skill.py").write_text(
+        dedent('''\
+            import os
+            import sys
+            from pathlib import Path
+
+            with Path("calls.txt").open("a") as calls:
+                calls.write(sys.argv[1] + "\\n")
+            if os.environ["FAIL_SECOND"] == "true" and sys.argv[1] == "dist/b.zip":
+                sys.exit(1)
+        ''')
+    )
+    result = run_workflow_step(
+        "publish", "Publish and promote skills", tmp_path,
+        env={**workflow_environment, "FAIL_SECOND": str(fail_second).lower(), "SKILLS_API_URL": "https://example.test"},
+    )
+    assert result.returncode == (1 if fail_second else 0), result.stderr
+    expected = ["dist/a.zip", "dist/b.zip"] if fail_second else ["dist/a.zip", "dist/b.zip", "dist/c.zip"]
+    assert (tmp_path / "calls.txt").read_text().splitlines() == expected
 
 
 @pytest.mark.parametrize("stale", [False, True])
@@ -25,19 +97,9 @@ def test_publish_workflow_rejects_stale_main(tmp_path: Path, stale: bool) -> Non
         git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", revision, cwd=checkout)
     git("push", "origin", "main", cwd=checkout)
     sha = git("rev-parse", "HEAD~1" if stale else "HEAD", cwd=checkout)
-    workflow = yaml.safe_load((Path(__file__).parents[1] / ".github/workflows/validate.yml").read_text())
-    guard = next(
-        step["run"]
-        for step in workflow["jobs"]["publish"]["steps"]
-        if step.get("name") == "Require the current main commit"
-    )
-    result = subprocess.run(
-        ["bash", "-e", "-c", guard],
-        cwd=checkout,
+    result = run_workflow_step(
+        "publish", "Require the current main commit", checkout,
         env={**os.environ, "GITHUB_SHA": sha},
-        capture_output=True,
-        text=True,
-        check=False,
     )
     assert result.returncode == (1 if stale else 0)
     if stale:

@@ -36,24 +36,38 @@ and executable flags. Unchanged inputs produce identical ZIPs.
 On pull requests and pushes to `main`, CI runs tests, checks types, and packages
 every directory under `skills/`. Open a completed run in
 [Actions](https://github.com/Further-AI/furtherai-skills/actions/workflows/validate.yml)
-and download `skill-bundles` under **Artifacts** to get one ZIP per skill.
+and download `skill-bundles` under **Artifacts** to get one ZIP per skill and a
+`catalog.json` listing the complete repository snapshot.
 
 When publishing is enabled, a successful run on the current `main` commit also:
 
-1. Authenticates to the backend with GitHub OIDC.
-2. Publishes the validated ZIP and its repository/commit provenance to US staging.
-   The backend stores the immutable bundle in Azure's private `skill-bundles` container.
-3. Promotes the returned content digest to `stable`.
+1. Authenticates with GitHub OIDC and reads the current backend catalog revision.
+2. Uploads every validated ZIP to US staging as an immutable Azure bundle.
+3. Activates the complete name-to-digest mapping in one conditional catalog write.
 
-All skills must pass validation before publishing starts. Bundles publish and promote
-one at a time; a failure stops the remaining bundles. Earlier promotions remain in
-place. Releases run one at a time; stale commits and conflicting promotions fail.
-Existing workflow runs keep their pinned versions.
-These checks validate packaging; they do not evaluate extraction quality.
+Additions, updates, and deletions take effect together. A missing artifact or failed
+upload leaves the previous catalog unchanged. The artifact manifest distinguishes
+an intentionally empty repository from an incomplete download; an empty manifest
+retires all FurtherAI skills. Releases run one at a time, and stale commits or
+conflicting catalog revisions fail without retrying activation.
+
+Existing pins keep their exact versions while the skill remains active. Removing
+a skill blocks future retrieval and resolution of that name, including saved pins;
+already staged content is not recalled. Historical bundles remain stored.
+Agent defaults and common skill selection stay in the backend. Publishing does not
+change rollout flags or organization/member preferences. These checks validate
+packaging; they do not evaluate task quality.
+
+To package a complete local artifact, use a fresh output directory:
+
+```sh
+uv run python -m scripts.skill_catalog skills --output dist/release
+```
 
 ## Enable staging publishing
 
-After the backend publishing API is deployed:
+Deploy the backend with `GET/PUT /api/v1/internal/skills/catalog` before enabling
+this publisher. An older backend rejects the new flow before any upload. Then:
 
 - Create a GitHub environment named `us-staging`, restricted to `main`.
 - In that environment, set `SKILLS_API_URL` to the backend's HTTPS base URL,
@@ -64,7 +78,7 @@ After the backend publishing API is deployed:
 
 Run **Validate and publish** manually on the current `main` commit to publish the
 skills. Later merges publish automatically. No Azure credentials or long-lived
-publishing token are needed in this repository. A promotion conflict stops the run;
+publishing token are needed in this repository. A catalog conflict stops the run;
 check the competing release before rerunning the current `main` commit.
 
 ## Adding a skill
@@ -95,7 +109,8 @@ Metadata field lengths follow the [Agent Skills specification](https://agentskil
 
 ## Development
 
-Packaging lives in [scripts/skill_bundle.py](scripts/skill_bundle.py); publishing
+Bundle validation lives in [scripts/skill_bundle.py](scripts/skill_bundle.py), complete
+packaging in [scripts/skill_catalog.py](scripts/skill_catalog.py), and publishing
 lives in [scripts/publish_skill.py](scripts/publish_skill.py). Tests are in `tests/`.
 
 ```sh

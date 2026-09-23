@@ -1,4 +1,4 @@
-"""Publish a validated CI artifact and conditionally promote it to stable."""
+"""Upload all validated bundles, then activate the complete repository catalog."""
 
 import argparse
 import os
@@ -8,12 +8,20 @@ from typing import IO, Annotated, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, TypeAdapter, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    TypeAdapter,
+    ValidationError,
+)
+
+from scripts.skill_catalog import SkillCatalog, SkillName
 
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
-SkillName = Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")]
 
 
 class CIContext(BaseModel):
@@ -43,17 +51,19 @@ class PublishedVersion(BaseModel):
     stable_digest: Digest | None
 
 
-class PromotionRequest(BaseModel):
-    """Promote only if stable still matches the version observed during upload."""
+class CatalogRelease(BaseModel):
+    """The complete mapping confirmed by the backend after atomic activation."""
 
-    content_digest: Digest
-    expected_digest: Digest | None
+    revision: UUID
+    commit_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    skills: dict[SkillName, Digest]
 
 
-class StableVersion(BaseModel):
-    """The digest confirmed by a successful promotion."""
+class CatalogActivationRequest(BaseModel):
+    """Activate every bundle together at the revision observed before uploading."""
 
-    content_digest: Digest
+    skills: dict[SkillName, Digest]
+    expected_revision: UUID | None
 
 
 class PublishingError(Exception):
@@ -97,7 +107,10 @@ def _multipart(bundle: Path, context: CIContext) -> tuple[bytes, str]:
     """Encode provenance and the exact ZIP bytes produced by validation."""
     boundary = uuid4().hex
     parts = []
-    for name, value in {"repository": context.repository, "commit_sha": context.commit_sha}.items():
+    for name, value in {
+        "repository": context.repository,
+        "commit_sha": context.commit_sha,
+    }.items():
         parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
     parts.append(
         f'--{boundary}\r\nContent-Disposition: form-data; name="bundle"; filename="skill.zip"\r\n'
@@ -126,65 +139,79 @@ def _identity_token(context: CIContext, audience: str) -> str:
     return IdentityToken.model_validate_json(token_response).value.get_secret_value()
 
 
-def publish_skill(bundle: Path, *, api_url: str, audience: str, context: CIContext) -> str:
-    """Publish the validated artifact, then promote using the observed stable digest.
+def publish_catalog(directory: Path, *, api_url: str, audience: str, context: CIContext) -> CatalogRelease:
+    """Upload a complete artifact and activate it once; conflicts stop the release.
 
-    A conflict stops the release. Retrying with a different expected digest here
-    could overwrite another publisher's promotion.
+    A manifest distinguishes an empty repository from a missing download. Failed
+    uploads leave the current catalog intact. Never retry with a newer revision:
+    doing so could overwrite a competing publisher's release.
     """
     _check_url(api_url)
     _check_url(context.token_url)
     if urlsplit(api_url).query or not audience:
         raise PublishingError("Set the API base URL without a query and a nonempty OIDC audience.")
-    # Validate the filename before using it as an API path component.
-    name = TypeAdapter(SkillName).validate_python(bundle.stem)
-    body, content_type = _multipart(bundle, context)
+    catalog = SkillCatalog.model_validate_json((directory / "catalog.json").read_bytes())
+    expected_files = {"catalog.json", *(f"{name}.zip" for name in catalog.skills)}
+    if {path.name for path in directory.iterdir()} != expected_files:
+        raise PublishingError("Artifact files do not match the complete catalog manifest.")
     token = _identity_token(context, audience)
     headers = {"Authorization": f"Bearer {token}"}
-    skill_url = f"{api_url.rstrip('/')}/api/v1/internal/skills/{name}"
-    response = _request(
-        Request(
-            f"{skill_url}/versions",
-            data=body,
-            headers={**headers, "Content-Type": content_type},
-            method="POST",
-        ),
-        "Publishing",
+    base_url = f"{api_url.rstrip('/')}/api/v1/internal/skills"
+    current = TypeAdapter(CatalogRelease | None).validate_json(
+        _request(Request(f"{base_url}/catalog", headers=headers), "Reading catalog")
     )
-    published = PublishedVersion.model_validate_json(response)
-    if published.name != name:
-        raise PublishingError("Publishing returned a different skill name.")
-    promotion = PromotionRequest(content_digest=published.content_digest, expected_digest=published.stable_digest)
+    skills: dict[str, str] = {}
+    for name in catalog.skills:
+        body, content_type = _multipart(directory / f"{name}.zip", context)
+        response = _request(
+            Request(
+                f"{base_url}/{name}/versions",
+                data=body,
+                headers={**headers, "Content-Type": content_type},
+                method="POST",
+            ),
+            "Publishing",
+        )
+        published = PublishedVersion.model_validate_json(response)
+        if published.name != name:
+            raise PublishingError("Publishing returned a different skill name.")
+        skills[name] = published.content_digest
+    activation = CatalogActivationRequest(skills=skills, expected_revision=current.revision if current else None)
     response = _request(
         Request(
-            f"{skill_url}/channels/stable",
-            data=promotion.model_dump_json().encode(),
+            f"{base_url}/catalog",
+            data=activation.model_dump_json().encode(),
             headers={**headers, "Content-Type": "application/json"},
             method="PUT",
         ),
-        "Promotion",
+        "Catalog activation",
     )
-    promoted = StableVersion.model_validate_json(response)
-    if promoted.content_digest != published.content_digest:
-        raise PublishingError("Promotion returned a different content digest.")
-    return promoted.content_digest
+    release = CatalogRelease.model_validate_json(response)
+    if release.skills != skills or release.commit_sha != context.commit_sha:
+        raise PublishingError("Activation returned a different repository snapshot.")
+    return release
 
 
 def main() -> None:
     """Publish from GitHub Actions using its short-lived OIDC identity."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("bundle", type=Path)
+    parser.add_argument("directory", type=Path)
     parser.add_argument("--api-url", required=True)
     parser.add_argument("--audience", required=True)
     args = parser.parse_args()
     try:
         context = CIContext.model_validate(dict(os.environ))
-        digest = publish_skill(args.bundle, api_url=args.api_url, audience=args.audience, context=context)
+        release = publish_catalog(
+            args.directory,
+            api_url=args.api_url,
+            audience=args.audience,
+            context=context,
+        )
     except ValidationError:
         parser.exit(1, "Invalid CI configuration or publishing API response.\n")
     except (PublishingError, OSError) as exc:
         parser.exit(1, f"{exc}\n")
-    print(f"Promoted {args.bundle.stem} to stable: {digest}")
+    print(f"Activated {len(release.skills)} skills from {release.commit_sha}: {release.revision}")
 
 
 if __name__ == "__main__":

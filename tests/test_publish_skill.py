@@ -1,4 +1,4 @@
-"""Check authenticated publishing, promotion conflicts, and transport failures."""
+"""Complete artifacts activate once; upload and transport failures never promote."""
 
 import json
 import sys
@@ -17,7 +17,7 @@ import pytest
 from pydantic import ValidationError
 
 from scripts import publish_skill
-from scripts.skill_bundle import build_bundle
+from scripts.skill_catalog import package_catalog
 
 DIGEST = "a" * 64
 PREVIOUS = "b" * 64
@@ -41,138 +41,183 @@ def context() -> publish_skill.CIContext:
 
 
 @pytest.fixture
-def bundle(tmp_path: Path) -> Path:
-    """Build an actual validated ZIP for the publishing flow."""
-    skill = tmp_path / "document-extraction"
-    skill.mkdir()
-    (skill / "SKILL.md").write_text(
-        "---\nname: document-extraction\ndescription: Extract fields.\n---\nExtract fields.\n"
-    )
-    output = tmp_path / "document-extraction.zip"
-    build_bundle(skill, output)
+def artifact(tmp_path: Path) -> Path:
+    """Package two real skills to exercise partial upload failures."""
+    source = tmp_path / "skills"
+    for name in ["document-extraction", "policy-comparison"]:
+        skill = source / name
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(f"---\nname: {name}\ndescription: Extract fields.\n---\nExtract.\n")
+    output = tmp_path / "dist"
+    package_catalog(source, output)
     return output
+
+
+def release(skills: dict[str, str]) -> bytes:
+    """Return the backend's catalog shape, including its concurrency revision."""
+    return json.dumps(
+        {
+            "revision": "11111111-1111-4111-8111-111111111111",
+            "commit_sha": "c" * 40,
+            "skills": skills,
+        }
+    ).encode()
 
 
 @pytest.fixture
 def request_mock() -> Iterator[Mock]:
-    """Keep publishing requests isolated from external services."""
+    """Keep external transport isolated while preserving the real publisher flow."""
     with patch.object(publish_skill, "_request") as mocked:
         mocked.side_effect = [
             b'{"value":"identity-token"}',
-            json.dumps({"name": "document-extraction", "content_digest": DIGEST, "stable_digest": None}).encode(),
-            json.dumps({"content_digest": DIGEST}).encode(),
+            b"null",
+            json.dumps(
+                {
+                    "name": "document-extraction",
+                    "content_digest": DIGEST,
+                    "stable_digest": None,
+                }
+            ).encode(),
+            json.dumps(
+                {
+                    "name": "policy-comparison",
+                    "content_digest": PREVIOUS,
+                    "stable_digest": None,
+                }
+            ).encode(),
+            release({"document-extraction": DIGEST, "policy-comparison": PREVIOUS}),
         ]
         yield mocked
 
 
-@pytest.mark.parametrize("stable_digest", [None, PREVIOUS, DIGEST])
-def test_publish_skill_uploads_exact_artifact_then_promotes_observed_version(
+def test_publish_catalog_uploads_every_artifact_before_one_activation(
     context: publish_skill.CIContext,
-    bundle: Path,
+    artifact: Path,
     request_mock: Mock,
-    stable_digest: str | None,
 ) -> None:
-    request_mock.side_effect = [
-        b'{"value":"identity-token"}',
-        json.dumps({"name": "document-extraction", "content_digest": DIGEST, "stable_digest": stable_digest}).encode(),
-        json.dumps({"content_digest": DIGEST}).encode(),
-    ]
-    assert publish_skill.publish_skill(bundle, api_url=API_URL, audience=AUDIENCE, context=context) == DIGEST
-    token_request, upload, promote = [call.args[0] for call in request_mock.call_args_list]
-    assert parse_qs(urlsplit(token_request.full_url).query) == {"request": ["1"], "audience": [AUDIENCE]}
-    assert token_request.get_header("Authorization") == "Bearer request-token"
-    assert upload.method == "POST"
-    assert upload.full_url == f"{API_URL}/api/v1/internal/skills/document-extraction/versions"
-    assert upload.get_header("Authorization") == "Bearer identity-token"
-    message = BytesParser(policy=policy.default).parsebytes(
-        f"Content-Type: {upload.get_header('Content-type')}\r\n\r\n".encode() + upload.data
-    )
-    parts = {
-        part.get_param("name", header="content-disposition"): part.get_payload(decode=True)
-        for part in message.iter_parts()
+    result = publish_skill.publish_catalog(artifact, api_url=API_URL, audience=AUDIENCE, context=context)
+    assert result.skills == {
+        "document-extraction": DIGEST,
+        "policy-comparison": PREVIOUS,
     }
-    assert parts == {
-        "repository": context.repository.encode(),
-        "commit_sha": context.commit_sha.encode(),
-        "bundle": bundle.read_bytes(),
+    token, current, first, second, activation = [call.args[0] for call in request_mock.call_args_list]
+    assert parse_qs(urlsplit(token.full_url).query) == {
+        "request": ["1"],
+        "audience": [AUDIENCE],
     }
-    assert promote.method == "PUT"
-    assert promote.full_url == f"{API_URL}/api/v1/internal/skills/document-extraction/channels/stable"
-    assert promote.get_header("Authorization") == "Bearer identity-token"
-    assert json.loads(promote.data) == {"content_digest": DIGEST, "expected_digest": stable_digest}
+    assert token.get_header("Authorization") == "Bearer request-token"
+    assert current.full_url == f"{API_URL}/api/v1/internal/skills/catalog"
+    assert current.get_method() == "GET"
+    for upload, name in [(first, "document-extraction"), (second, "policy-comparison")]:
+        assert upload.method == "POST"
+        assert upload.full_url == f"{API_URL}/api/v1/internal/skills/{name}/versions"
+        assert upload.get_header("Authorization") == "Bearer identity-token"
+        message = BytesParser(policy=policy.default).parsebytes(
+            f"Content-Type: {upload.get_header('Content-type')}\r\n\r\n".encode() + upload.data
+        )
+        parts = {
+            part.get_param("name", header="content-disposition"): part.get_payload(decode=True)
+            for part in message.iter_parts()
+        }
+        assert parts == {
+            "repository": context.repository.encode(),
+            "commit_sha": context.commit_sha.encode(),
+            "bundle": (artifact / f"{name}.zip").read_bytes(),
+        }
+    assert activation.method == "PUT"
+    assert activation.full_url == current.full_url
+    assert json.loads(activation.data) == {
+        "skills": result.skills,
+        "expected_revision": None,
+    }
 
 
-@pytest.mark.parametrize("failure_step", [0, 1, 2])
-def test_publish_skill_stops_on_failure_without_retrying(
+@pytest.mark.parametrize("failure_step", range(5))
+def test_publish_catalog_stops_on_failure_without_retrying(
     context: publish_skill.CIContext,
-    bundle: Path,
+    artifact: Path,
     request_mock: Mock,
     failure_step: int,
 ) -> None:
-    responses = [
-        b'{"value":"identity-token"}',
-        json.dumps({"name": "document-extraction", "content_digest": DIGEST, "stable_digest": None}).encode(),
+    responses = list(request_mock.side_effect)
+    request_mock.side_effect = [
+        *responses[:failure_step],
+        publish_skill.PublishingError("HTTP 409"),
     ]
-    request_mock.side_effect = [*responses[:failure_step], publish_skill.PublishingError("HTTP 409")]
     with pytest.raises(publish_skill.PublishingError, match="HTTP 409"):
-        publish_skill.publish_skill(bundle, api_url=API_URL, audience=AUDIENCE, context=context)
+        publish_skill.publish_catalog(artifact, api_url=API_URL, audience=AUDIENCE, context=context)
     assert request_mock.call_count == failure_step + 1
 
 
-@pytest.mark.parametrize(
-    "response",
-    [
-        b"not JSON",
-        b"{}",
-        json.dumps({"name": "document-extraction", "content_digest": "invalid", "stable_digest": None}).encode(),
-        json.dumps({"name": "different-skill", "content_digest": DIGEST, "stable_digest": None}).encode(),
-    ],
-)
-def test_publish_skill_invalid_upload_response_blocks_promotion(
+@pytest.mark.parametrize("invalid", [b"not JSON", b"{}", b'{"name":"wrong","content_digest":"invalid"}'])
+def test_invalid_upload_response_blocks_activation(
     context: publish_skill.CIContext,
-    bundle: Path,
+    artifact: Path,
     request_mock: Mock,
-    response: bytes,
+    invalid: bytes,
 ) -> None:
-    request_mock.side_effect = [b'{"value":"identity-token"}', response]
+    request_mock.side_effect = [b'{"value":"identity-token"}', b"null", invalid]
     with pytest.raises((ValidationError, publish_skill.PublishingError)):
-        publish_skill.publish_skill(bundle, api_url=API_URL, audience=AUDIENCE, context=context)
-    assert request_mock.call_count == 2
+        publish_skill.publish_catalog(artifact, api_url=API_URL, audience=AUDIENCE, context=context)
+    assert request_mock.call_count == 3
 
 
-def test_publish_skill_rejects_unconfirmed_promotion(
+def test_empty_catalog_retires_all_at_observed_revision(
     context: publish_skill.CIContext,
-    bundle: Path,
+    tmp_path: Path,
     request_mock: Mock,
 ) -> None:
+    source = tmp_path / "empty"
+    source.mkdir()
+    artifact = tmp_path / "dist"
+    package_catalog(source, artifact)
     request_mock.side_effect = [
         b'{"value":"identity-token"}',
-        json.dumps({"name": "document-extraction", "content_digest": DIGEST, "stable_digest": None}).encode(),
-        json.dumps({"content_digest": PREVIOUS}).encode(),
+        release({"old": DIGEST}),
+        release({}),
     ]
-    with pytest.raises(publish_skill.PublishingError, match="different content digest"):
-        publish_skill.publish_skill(bundle, api_url=API_URL, audience=AUDIENCE, context=context)
+    assert publish_skill.publish_catalog(artifact, api_url=API_URL, audience=AUDIENCE, context=context).skills == {}
+    activation = request_mock.call_args.args[0]
+    assert json.loads(activation.data) == {
+        "skills": {},
+        "expected_revision": "11111111-1111-4111-8111-111111111111",
+    }
+    assert request_mock.call_count == 3
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("GITHUB_REPOSITORY", "someone/furtherai-skills"),
-        ("GITHUB_SHA", "main"),
-        ("GITHUB_REF", "refs/heads/feature"),
-        ("GITHUB_EVENT_NAME", "pull_request"),
-        ("ACTIONS_ID_TOKEN_REQUEST_TOKEN", ""),
-    ],
+    "problem",
+    ["missing_zip", "extra_zip", "missing_manifest", "invalid_name", "duplicate"],
 )
-def test_context_rejects_untrusted_or_missing_release_identity(
+def test_incomplete_artifact_is_rejected_before_network(
     context: publish_skill.CIContext,
-    field: str,
-    value: str,
+    artifact: Path,
+    request_mock: Mock,
+    problem: str,
 ) -> None:
-    values = context.model_dump(by_alias=True)
-    values[field] = value
-    with pytest.raises(ValidationError):
-        publish_skill.CIContext.model_validate(values)
+    if problem == "missing_zip":
+        (artifact / "policy-comparison.zip").unlink()
+    elif problem == "extra_zip":
+        (artifact / "extra.zip").write_bytes(b"extra")
+    elif problem == "missing_manifest":
+        (artifact / "catalog.json").unlink()
+    else:
+        names = ["../bad"] if problem == "invalid_name" else ["same", "same"]
+        (artifact / "catalog.json").write_text(json.dumps({"skills": names}))
+    with pytest.raises((OSError, ValidationError, publish_skill.PublishingError)):
+        publish_skill.publish_catalog(artifact, api_url=API_URL, audience=AUDIENCE, context=context)
+    request_mock.assert_not_called()
+
+
+def test_mismatched_activation_is_not_reported_as_success(
+    context: publish_skill.CIContext,
+    artifact: Path,
+    request_mock: Mock,
+) -> None:
+    responses = list(request_mock.side_effect)
+    request_mock.side_effect = [*responses[:-1], release({})]
+    with pytest.raises(publish_skill.PublishingError, match="different repository snapshot"):
+        publish_skill.publish_catalog(artifact, api_url=API_URL, audience=AUDIENCE, context=context)
 
 
 @pytest.mark.parametrize(
@@ -185,15 +230,86 @@ def test_context_rejects_untrusted_or_missing_release_identity(
         "https://backend.example/?query=1",
     ],
 )
-def test_publish_skill_rejects_invalid_api_url_before_sending_credentials(
+def test_invalid_api_url_never_sends_credentials(
     context: publish_skill.CIContext,
-    bundle: Path,
+    artifact: Path,
     request_mock: Mock,
     url: str,
 ) -> None:
     with pytest.raises(publish_skill.PublishingError):
-        publish_skill.publish_skill(bundle, api_url=url, audience=AUDIENCE, context=context)
+        publish_skill.publish_catalog(artifact, api_url=url, audience=AUDIENCE, context=context)
     request_mock.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("GITHUB_REPOSITORY", "someone/skills"),
+        ("GITHUB_SHA", "main"),
+        ("GITHUB_REF", "refs/heads/feature"),
+        ("GITHUB_EVENT_NAME", "pull_request"),
+        ("ACTIONS_ID_TOKEN_REQUEST_TOKEN", ""),
+    ],
+)
+def test_context_rejects_untrusted_identity(context: publish_skill.CIContext, field: str, value: str) -> None:
+    values = context.model_dump(by_alias=True)
+    values[field] = value
+    with pytest.raises(ValidationError):
+        publish_skill.CIContext.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    "token_url",
+    ["http://github.example/token", "https://token:secret@github.example/token"],
+)
+def test_invalid_oidc_url_never_sends_credentials(
+    context: publish_skill.CIContext,
+    artifact: Path,
+    request_mock: Mock,
+    token_url: str,
+) -> None:
+    context.token_url = token_url
+    with pytest.raises(publish_skill.PublishingError):
+        publish_skill.publish_catalog(artifact, api_url=API_URL, audience=AUDIENCE, context=context)
+    request_mock.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_main_reports_result_without_tokens(
+    context: publish_skill.CIContext,
+    artifact: Path,
+    request_mock: Mock,
+    capsys: pytest.CaptureFixture[str],
+    failure: bool,
+) -> None:
+    environment = context.model_dump(by_alias=True)
+    environment["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = "secret-token"
+    if failure:
+        request_mock.side_effect = [b'{"value":"secret-token"}', b"secret-token"]
+    with (
+        patch.dict(publish_skill.os.environ, environment, clear=True),
+        patch.object(
+            sys,
+            "argv",
+            [
+                "publish_skill.py",
+                str(artifact),
+                "--api-url",
+                API_URL,
+                "--audience",
+                AUDIENCE,
+            ],
+        ),
+    ):
+        if failure:
+            with pytest.raises(SystemExit) as error:
+                publish_skill.main()
+            assert error.value.code == 1
+        else:
+            publish_skill.main()
+    output = capsys.readouterr()
+    assert "secret-token" not in output.err + output.out
+    assert ("Invalid CI configuration" in output.err) if failure else ("Activated 2 skills" in output.out)
 
 
 @pytest.fixture
@@ -237,7 +353,10 @@ def test_request_returns_successful_response(http_server: tuple[str, list[str]],
 def test_request_rejects_redirects_and_hides_error_body(http_server: tuple[str, list[str]], path: str) -> None:
     url, paths = http_server
     with pytest.raises(publish_skill.PublishingError, match="Publishing failed \\(HTTP") as error:
-        publish_skill._request(Request(f"{url}{path}", headers={"Authorization": "Bearer secret"}), "Publishing")
+        publish_skill._request(
+            Request(f"{url}{path}", headers={"Authorization": "Bearer secret"}),
+            "Publishing",
+        )
     assert "secret" not in str(error.value)
     assert paths == [path]
 
@@ -249,82 +368,3 @@ def test_request_network_failure_hides_connection_details(failure: Exception) ->
         with pytest.raises(publish_skill.PublishingError, match="could not reach") as error:
             publish_skill._request(Request(API_URL), "Publishing")
     assert "secret-host" not in str(error.value)
-
-
-@pytest.mark.parametrize("token_url", ["http://github.example/token", "https://token:secret@github.example/token"])
-def test_publish_skill_invalid_oidc_url_blocks_token_request(
-    context: publish_skill.CIContext,
-    bundle: Path,
-    request_mock: Mock,
-    token_url: str,
-) -> None:
-    context.token_url = token_url
-    with pytest.raises(publish_skill.PublishingError):
-        publish_skill.publish_skill(bundle, api_url=API_URL, audience=AUDIENCE, context=context)
-    request_mock.assert_not_called()
-
-
-@pytest.mark.parametrize("filename", ["Bad_Name.zip", "skill.name.zip"])
-def test_publish_skill_invalid_name_blocks_token_request(
-    context: publish_skill.CIContext,
-    bundle: Path,
-    request_mock: Mock,
-    filename: str,
-) -> None:
-    with pytest.raises(ValidationError):
-        publish_skill.publish_skill(bundle.with_name(filename), api_url=API_URL, audience=AUDIENCE, context=context)
-    request_mock.assert_not_called()
-
-
-@pytest.mark.parametrize("failure", ["identity", "api_response", "publishing"])
-def test_main_reports_failure_without_exposing_tokens(
-    context: publish_skill.CIContext,
-    bundle: Path,
-    request_mock: Mock,
-    capsys: pytest.CaptureFixture[str],
-    failure: str,
-) -> None:
-    environment = context.model_dump(by_alias=True)
-    environment["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = "secret-token"
-    if failure == "identity":
-        environment.pop("GITHUB_REF")
-    elif failure == "api_response":
-        request_mock.side_effect = [b'{"value":"secret-token"}', b"secret-token"]
-    else:
-        request_mock.side_effect = publish_skill.PublishingError("Publishing failed (HTTP 403).")
-    with (
-        patch.dict(publish_skill.os.environ, environment, clear=True),
-        patch.object(
-            sys,
-            "argv",
-            ["publish_skill.py", str(bundle), "--api-url", API_URL, "--audience", AUDIENCE],
-        ),
-        pytest.raises(SystemExit) as error,
-    ):
-        publish_skill.main()
-    assert error.value.code == 1
-    output = capsys.readouterr()
-    assert "secret-token" not in output.err + output.out
-    expected = "HTTP 403" if failure == "publishing" else "Invalid CI configuration"
-    assert expected in output.err
-
-
-def test_main_reports_confirmed_stable_digest(
-    context: publish_skill.CIContext,
-    bundle: Path,
-    request_mock: Mock,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    environment = context.model_dump(by_alias=True)
-    environment["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = "secret-token"
-    with (
-        patch.dict(publish_skill.os.environ, environment, clear=True),
-        patch.object(
-            sys,
-            "argv",
-            ["publish_skill.py", str(bundle), "--api-url", API_URL, "--audience", AUDIENCE],
-        ),
-    ):
-        publish_skill.main()
-    assert request_mock.call_count == 3
-    assert capsys.readouterr().out == f"Promoted document-extraction to stable: {DIGEST}\n"

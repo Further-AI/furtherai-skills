@@ -24,13 +24,12 @@ jobs:
       - run: uv run ty check scripts tests
       - name: Package skills
         run: |
-          for skill in skills/*; do
-            uv run python scripts/skill_bundle.py "$skill" --output "dist/$(basename "$skill").zip"
-          done
+          mkdir -p skills
+          uv run python -m scripts.skill_catalog skills --output dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: skill-bundles
-          path: dist/*.zip
+          path: dist/
           if-no-files-found: error
 
   publish:
@@ -70,12 +69,10 @@ jobs:
           version: "0.10.4"
           python-version: "3.12"
       - run: uv sync --locked
-      - name: Publish and promote skills
+      - name: Publish complete catalog
         env:
           SKILLS_API_URL: ${{ vars.SKILLS_API_URL }}
         run: |
-          for bundle in dist/*.zip; do
-            uv run python scripts/publish_skill.py "$bundle" \
-              --api-url "$SKILLS_API_URL" \
-              --audience furtherai-skills-us-staging
-          done
+          uv run python -m scripts.publish_skill dist \
+            --api-url "$SKILLS_API_URL" \
+            --audience furtherai-skills-us-staging

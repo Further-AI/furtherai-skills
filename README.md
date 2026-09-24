@@ -8,6 +8,7 @@ uses to perform a task.
 
 | Skill | Purpose |
 | --- | --- |
+| [Excel generation](skills/excel-generation/SKILL.md) | Build and check Excel workbooks from insurance documents and spreadsheets. |
 | [Document extraction](skills/document-extraction/SKILL.md) | Extract structured fields from insurance documents. |
 | [Policy comparison](skills/policy-comparison/SKILL.md) | Compare policies, quotes, and renewal changes. |
 | [Loss-run analysis](skills/loss-run-analysis/SKILL.md) | Summarize claims history, losses, and trends. |
@@ -89,7 +90,8 @@ delimiters, followed by the instructions. The name must match the folder.
 Use an existing skill as an example.
 
 Optional `scripts/`, `references/`, `assets/`, and other resource files are included
-recursively. Only the skill's root `tests/` directory is excluded. Run the same
+recursively. The skill's root `tests/` and all `__pycache__/` directories are
+excluded. Run the same
 packaging command with your skill's path; CI discovers it automatically.
 
 Packaging rejects symlinks, special files, and unsafe paths. Limits per skill:
@@ -115,5 +117,5 @@ lives in [scripts/publish_skill.py](scripts/publish_skill.py). Tests are in `tes
 
 ```sh
 uv run pytest -x --tb=short
-uv run ty check scripts tests
+uv run ty check scripts tests skills/excel-generation/scripts
 ```
